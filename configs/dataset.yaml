@@ -2,113 +2,137 @@ defaults:
   - dataset_base
   - _self_
 
-connection_uri: "postgres://${oc.env:USER}:@localhost:5432/mimiciv"
+connection_uri: "postgres://${oc.env:USER}:@localhost:5432/eicu"
 save_dir: "${oc.env:PROJECT_DATA_DIR}/${cohort_name}"
-subject_id_col: "subject_id"
+subject_id_col: "uniquepid"
 min_los: 3
 min_admissions: 1
 inputs:
   patients:
     query: |-
-      SELECT subject_id, gender, to_date((anchor_year-anchor_age)::CHAR(4), 'YYYY') AS year_of_birth
-      FROM mimiciv_hosp.patients
-      WHERE subject_id IN (
-        SELECT long_icu.subject_id FROM (
-          (
-            SELECT subject_id FROM mimiciv_icu.icustays WHERE los > ${min_los}
-          ) AS long_icu INNER JOIN (
-            SELECT subject_id
-            FROM mimiciv_hosp.admissions
-            GROUP BY subject_id
-            HAVING COUNT(*) > ${min_admissions}
-          ) AS many_admissions
-          ON long_icu.subject_id = many_admissions.subject_id
-        )
+      SELECT uniquePID, gender, CASE WHEN ((age = '') IS NOT FALSE)  THEN NULL ELSE to_date((hospitaldischargeyear::BIGINT-REPLACE(age, '> 89','90')::BIGINT)::CHAR(4), 'YYYY') END AS year_of_birth
+      FROM eicu_crd.patient
+      WHERE uniquePID IN (
+        SELECT uniquePID FROM eicu_crd.patient
+        WHERE hospitaldischargeoffset > ${min_los}
+        GROUP BY uniquePID
+        HAVING COUNT(*) > ${min_admissions}
       )
     must_have: ["gender", "year_of_birth"]
   death:
-    query: "SELECT subject_id, deathtime FROM mimiciv_hosp.admissions WHERE deathtime IS NOT NULL"
+    # query: "SELECT subject_id, deathtime FROM mimiciv_hosp.admissions WHERE deathtime IS NOT NULL"
+    # need to join patient.csv with 
+    query: "SELECT uniquePID AS uniquepid, hospitaladmitdatetime + interval '1 minute' * hospitaldischargeoffset AS deathtime FROM eicu_crd.patient WHERE hospitaldischargeoffset IS NOT NULL AND unitdischargelocation = 'Death'"
     ts_col: "deathtime"
   admissions:
-    query: "SELECT * FROM mimiciv_hosp.admissions"
-    start_ts_col: "admittime"
+    query: "SELECT uniquePID as uniquepid, hospitaladmitdatetime, hospitaladmitdatetime - interval '1 minute' * hospitaladmitoffset + interval '1 minute' * hospitaldischargeoffset as dischtime, hospitaladmitsource, wardid, hospitalid, ethnicity, admissionheight, admissionweight, hospitaldischargestatus, hospitaldischargelocation  FROM eicu_crd.patient"
+    start_ts_col: "hospitaladmitdatetime"
     end_ts_col: "dischtime"
     start_columns:
-      - "admission_type"
-      - "admission_location"
-      - "language"
-      - "race"
-      - "marital_status"
-      - "insurance"
-    end_columns: ["discharge_location"]
+      # - "admission_type"
+      # - "admission_location"
+      # - "language"
+      # - "race"
+      # - "marital_status"
+      # - "insurance"
+      - "hospitaladmitsource"
+      - "wardid"
+      - "hospitalid" #admission_location
+      # - "language"
+      - "ethnicity"
+      - "admissionheight"
+      - "admissionweight"
+    end_columns:
+      - "hospitaldischargelocation"
+      - "hospitaldischargestatus"
     event_type: ["VISIT", "ADMISSION", "DISCHARGE"]
   icu_stays:
-    query: "SELECT * FROM mimiciv_icu.icustays"
+    query: "SELECT uniquePID as uniquepid, unittype, hospitaladmitdatetime - interval '1 minute' * hospitaladmitoffset as intime, hospitaladmitdatetime - interval '1 minute' * hospitaladmitoffset  + interval '1 minute' * unitdischargeoffset as outtime  FROM eicu_crd.patient where LOWER(unittype) LIKE '%icu%'"
     start_ts_col: "intime"
     end_ts_col: "outtime"
-    start_columns: { "first_careunit": "careunit" }
-    end_columns: { "last_careunit": "careunit" }
+    start_columns: ["unittype"]
+      #first_careunit: unittype
+    end_columns: ["unittype"]
+      # last_careunit: unittype
   diagnoses:
     query: |-
       SELECT
-        admissions.subject_id,
-        admissions.dischtime,
-        ('ICD_' || diagnoses.icd_version || ' ' || TRIM(diagnoses.icd_code)) AS icd_code
+        patient.uniquePID as uniquepid,
+        patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset + interval '1 minute' * patient.hospitaldischargeoffset as dischtime,
+        ('ICD_9 '::TEXT || COALESCE((regexp_match(TRIM(diagnosis.icd9code), '[A-z]\d{1,3}\.\d+'))[1]::TEXT, NULL)) AS icd_code
       FROM (
-        mimiciv_hosp.diagnoses_icd AS diagnoses JOIN mimiciv_hosp.admissions AS admissions
-        ON admissions.hadm_id = diagnoses.hadm_id
+        eicu_crd.diagnosis AS diagnosis JOIN eicu_crd.patient AS patient
+        ON patient.patientunitstayid = diagnosis.patientunitstayid
       )
     ts_col: "dischtime"
   labs:
     query:
       - |-
-        SELECT subject_id, charttime, (itemid || ' (' || valueuom || ')') AS lab_itemid, valuenum FROM
-        mimiciv_hosp.labevents
-      - |-
-        SELECT subject_id, charttime, (itemid || ' (' || valueuom || ')') AS lab_itemid, valuenum FROM
-        mimiciv_icu.chartevents
+        SELECT patient.uniquePID as uniquepid, 
+          patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset + interval '1 minute' * lab.labresultoffset AS charttime,
+          (lab.labname || ' (' || lab.labmeasurenamesystem || ')') AS lab_itemid,
+          lab.labresult as labresult
+        FROM (
+          eicu_crd.lab AS lab JOIN eicu_crd.patient AS patient
+          ON patient.patientunitstayid = lab.patientunitstayid
+        )
     ts_col: "charttime"
   infusions:
     query: |-
       SELECT
-        icustays.subject_id,
-        inputevents.itemid AS infusion_itemid,
-        inputevents.totalamount,
-        inputevents.patientweight,
-        inputevents.starttime,
-        inputevents.endtime
+        patient.uniquePID,
+        infusiondrug.drugname AS infusion_itemid,
+        infusiondrug.drugamount,
+        infusiondrug.drugrate,
+        infusiondrug.patientweight,
+        patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset + interval '1 minute' * infusiondrug.infusionoffset AS starttime,
+        CASE WHEN infusiondrug.drugname LIKE '%units/hr%' THEN patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset  + interval '1 minute' * infusiondrug.infusionoffset + interval '60 minute' * (infusiondrug.drugamount::DECIMAL / infusiondrug.drugrate::FLOAT)
+          WHEN ((infusiondrug.drugname LIKE '%mcg/kg/min%') AND ((infusiondrug.patientweight = '') IS NOT TRUE)) AND (infusiondrug.patientweight::FLOAT > 0) THEN patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset  + interval '1 minute' * infusiondrug.infusionoffset + interval '1 minute' * (infusiondrug.drugamount::DECIMAL / COALESCE(infusiondrug.patientweight, '70')::FLOAT / infusiondrug.drugrate::FLOAT)
+          ELSE patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset  + interval '1 minute' * infusiondrug.infusionoffset + interval '1 minute' * (infusiondrug.drugamount::DECIMAL / infusiondrug.drugrate::FLOAT)
+        END AS endtime
       FROM (
-        mimiciv_icu.icustays AS icustays INNER JOIN mimiciv_icu.inputevents AS inputevents
-        ON inputevents.stay_id = icustays.stay_id
-      )
+        eicu_crd.patient AS patient INNER JOIN eicu_crd.infusiondrug AS infusiondrug
+        ON patient.patientunitstayid = infusiondrug.patientunitstayid
+      ) WHERE ((infusiondrug.drugamount ~ '^\d+(\.\d+)?$') AND (infusiondrug.drugrate ~ '^\d+(\.\d+)?$')) AND (infusiondrug.drugrate::FLOAT > 0)
     start_ts_col: "starttime"
     end_ts_col: "endtime"
   procedures:
     query: |-
       SELECT
-        icustays.subject_id,
-        procedureevents.itemid AS procedure_itemid,
-        procedureevents.starttime,
-        procedureevents.endtime
+        patient.uniquePID as uniquepid,
+        patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset  + interval '1 minute' * treatment.treatmentoffset AS charttime,
+        treatment.treatmentstring
       FROM (
-        mimiciv_icu.icustays AS icustays INNER JOIN mimiciv_icu.procedureevents AS procedureevents
-        ON procedureevents.stay_id = icustays.stay_id
+        eicu_crd.patient AS patient INNER JOIN eicu_crd.treatment AS treatment
+        ON treatment.patientunitstayid = patient.patientunitstayid
       )
-      WHERE procedureevents.ordercategorydescription IN ('Task', 'ContinuousProcess')
-    start_ts_col: "starttime"
-    end_ts_col: "endtime"
+    ts_col: "charttime"
   medications:
     query: |-
       SELECT
-        icustays.subject_id,
-        emar.charttime,
-        emar.medication
+        patient.uniquePID as uniquepid,
+        patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset + interval '1 minute' * medication.drugstartoffset AS starttime,
+        patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset + interval '1 minute' * medication.drugstopoffset AS endtime,
+        medication.drugname as medication
       FROM (
-        mimiciv_icu.icustays AS icustays INNER JOIN mimiciv_hosp.emar AS emar
-        ON emar.hadm_id = icustays.hadm_id
+        eicu_crd.patient AS patient INNER JOIN eicu_crd.medication AS medication
+        ON patient.patientunitstayid = medication.patientunitstayid
       )
-      WHERE icustays.intime <= emar.charttime AND emar.charttime <= icustays.outtime
+      WHERE (patient.hospitaladmitdatetime - interval '1 minute'* hospitaladmitoffset) <= (patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset  + interval '1 minute' * medication.drugstartoffset) AND (patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset  + interval '1 minute' * medication.drugstopoffset) <= (patient.hospitaladmitdatetime - interval '1 minute'* hospitaladmitoffset + interval '1 minute' * patient.hospitaldischargeoffset) 
+    start_ts_col: "starttime"
+    end_ts_col: "endtime"
+  cultures:
+    query: |-
+        SELECT patient.uniquePID as uniquepid, 
+          patient.hospitaladmitdatetime - interval '1 minute' * patient.hospitaladmitoffset  + interval '1 minute' * microlab.culturetakenoffset AS charttime,
+          ('culture' || ' (' || microlab.culturesite || ')') AS lab_itemid,
+          microlab.organism::CHAR as organism
+        FROM (
+          eicu_crd.microlab AS microlab JOIN eicu_crd.patient AS patient
+          ON patient.patientunitstayid = microlab.patientunitstayid
+        )
     ts_col: "charttime"
+
 
 measurements:
   static:
@@ -125,22 +149,25 @@ measurements:
   dynamic:
     multi_label_classification:
       admissions:
-        - "admission_type"
-        - "admission_location"
-        - "language"
-        - "race"
-        - "marital_status"
-        - "insurance"
-        - "discharge_location"
-      icu_stays: ["careunit"]
+        - "hospitaladmitsource" #admission_type
+        - "hospitalid" #admission_location
+        - "wardid" #admission_location
+        # - "language"
+        - "ethnicity" # race
+        # - "marital_status"
+        # - "insurance"
+        - "hospitaldischargestatus" # discharge location
+        - hospitaldischargelocation
+      icu_stays: ["unittype"]
       diagnoses: ["icd_code"]
-      procedures: ["procedure_itemid"]
+      procedures: ["treatmentstring"]
       medications: ["medication"]
+      cultures: ["organism"]
     multivariate_regression:
-      labs: [["lab_itemid", "valuenum"]]
-      infusions: [["infusion_itemid", "totalamount"]]
+      labs: [["lab_itemid", "labresult"]]
+      infusions: [["infusion_itemid", "drugamount"]]
     univariate_regression:
-      infusions: ["patientweight"]
+      admissions: ["admissionweight","admissionheight"]
 
 outlier_detector_config:
   stddev_cutoff: 4.0
@@ -151,3 +178,5 @@ min_unique_numerical_observations: 25
 min_events_per_subject: 20
 agg_by_time_scale: "2h"
 DL_chunk_size: 4000
+
+
